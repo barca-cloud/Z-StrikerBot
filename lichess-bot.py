@@ -143,8 +143,8 @@ ponder_results = {}
 
 @backoff.on_exception(backoff.expo, BaseException, max_time=600, giveup=is_final)
 def play_game(li, game_id, engine_factory, user_profile, config):
-    li.chat(game_id,"player","Hello buddy! :D ")
-    li.chat(game_id,"spectator","Hi Guys!  XD  ")
+    li.chat(game_id,"player","Hello! running on: stockfish 14 dev + popcnt. :D ")
+    li.chat(game_id,"spectator","Hi Guys! pls challenge me! XD  ")
     response = li.get_game_stream(game_id)
     lines = response.iter_lines()
 
