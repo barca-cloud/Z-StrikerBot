@@ -2,6 +2,10 @@ import os
 import chess.engine
 import backoff
 import subprocess
+import logging
+from enum import Enum
+
+logger = logging.getLogger(__name__)
 
 
 @backoff.on_exception(backoff.expo, BaseException, max_time=120)
@@ -17,7 +21,15 @@ def create_engine(config):
 
     stderr = None if cfg.get("silence_stderr", False) else subprocess.DEVNULL
 
-    Engine = XBoardEngine if engine_type == "xboard" else UCIEngine
+    if engine_type == "xboard":
+        Engine = XBoardEngine
+    elif engine_type == "uci":
+        Engine = UCIEngine
+    elif engine_type == "homemade":
+        Engine = getHomemadeEngine(cfg["name"])
+    else:
+        raise ValueError(
+            f"    Invalid engine type: {engine_type}. Expected xboard, uci, or homemade.")
     options = remove_managed_options(cfg.get(engine_type + "_options", {}) or {})
     return Engine(commands, options, stderr)
 
@@ -29,32 +41,77 @@ def remove_managed_options(config):
     return {name: value for (name, value) in config.items() if not is_managed(name)}
 
 
+class Termination(str, Enum):
+    MATE = 'mate'
+    TIMEOUT = 'outoftime'
+    RESIGN = 'resign'
+    ABORT = 'aborted'
+    DRAW = 'draw'
+
+
+class GameEnding(str, Enum):
+    WHITE_WINS = '1-0'
+    BLACK_WINS = '0-1'
+    DRAW = '1/2-1/2'
+    INCOMPLETE = '*'
+
+
 class EngineWrapper:
     def __init__(self, commands, options, stderr):
         pass
 
-    def set_time_control(self, game):
-        pass
+    def search_for(self, board, movetime, ponder, draw_offered):
+        return self.search(board, chess.engine.Limit(time=movetime // 1000), ponder, draw_offered)
 
-    def first_search(self, board, movetime, ponder):
-        return self.search(board, chess.engine.Limit(time=movetime // 1000), ponder)
+    def first_search(self, board, movetime, draw_offered):
+        # No pondering after the first move since a different clock is used afterwards.
+        return self.search(board, chess.engine.Limit(time=movetime // 1000), False, draw_offered)
 
-    def search_with_ponder(self, board, wtime, btime, winc, binc, ponder):
-        pass
+    def search_with_ponder(self, board, wtime, btime, winc, binc, ponder, draw_offered):
+        cmds = self.go_commands
+        movetime = cmds.get("movetime")
+        if movetime is not None:
+            movetime = float(movetime) / 1000
+        time_limit = chess.engine.Limit(white_clock=wtime / 1000,
+                                        black_clock=btime / 1000,
+                                        white_inc=winc / 1000,
+                                        black_inc=binc / 1000,
+                                        depth=cmds.get("depth"),
+                                        nodes=cmds.get("nodes"),
+                                        time=movetime)
+        return self.search(board, time_limit, ponder, draw_offered)
 
-    def search(self, board, time_limit, ponder):
-        result = self.engine.play(board, time_limit, info=chess.engine.INFO_ALL, ponder=ponder)
+    def search(self, board, time_limit, ponder, draw_offered):
+        result = self.engine.play(board, time_limit, info=chess.engine.INFO_ALL, ponder=ponder, draw_offered=draw_offered)
         self.last_move_info = result.info
-        self.print_stats()
-        return result.move
+        self.print_stats(board)
+        return result
 
-    def print_stats(self):
-        for line in self.get_stats():
-            print(f"    {line}")
+    def print_stats(self, board):
+        for line in self.get_stats(board):
+            logger.info(f"{line}")
 
-    def get_stats(self):
-        info = self.last_move_info
-        stats = ["depth", "nps", "nodes", "score"]
+    def get_stats(self, board, for_chat=False):
+        info = self.last_move_info.copy()
+        if "pv" not in info:
+            info["pv"] = []
+        if for_chat:
+            stats = ["depth", "nps", "nodes", "score", "ponderpv"]
+            bot_stats = [f"{stat}: {info[stat]}" for stat in stats if stat in info]
+            len_bot_stats = len(", ".join(bot_stats)) + 12  # 12 is the length of ', ponderpv: '
+            ponder_pv = board.variation_san(info["pv"])
+            ponder_pv = ponder_pv.split()
+            try:
+                while len(' '.join(ponder_pv)) + len_bot_stats > 140:
+                    ponder_pv.pop()
+                if ponder_pv[-1].endswith('.'):
+                    ponder_pv.pop()
+                info["ponderpv"] = ' '.join(ponder_pv)
+            except IndexError:
+                pass
+        else:
+            stats = ["depth", "nps", "nodes", "score", "ponderpv"]
+            info["ponderpv"] = board.variation_san(info["pv"])
         return [f"{stat}: {info[stat]}" for stat in stats if stat in info]
 
     def get_opponent_info(self, game):
@@ -62,6 +119,9 @@ class EngineWrapper:
 
     def name(self):
         return self.engine.id["name"]
+
+    def report_game_result(self, game, board):
+        pass
 
     def stop(self):
         pass
@@ -77,20 +137,6 @@ class UCIEngine(EngineWrapper):
         self.engine.configure(options)
         self.last_move_info = {}
 
-    def search_with_ponder(self, board, wtime, btime, winc, binc, ponder):
-        cmds = self.go_commands
-        movetime = cmds.get("movetime")
-        if movetime is not None:
-            movetime = float(movetime) / 1000
-        time_limit = chess.engine.Limit(white_clock=wtime / 1000,
-                                        black_clock=btime / 1000,
-                                        white_inc=winc / 1000,
-                                        black_inc=binc / 1000,
-                                        depth=cmds.get("depth"),
-                                        nodes=cmds.get("nodes"),
-                                        time=movetime)
-        return self.search(board, time_limit, ponder)
-
     def stop(self):
         self.engine.protocol.send_line("stop")
 
@@ -102,37 +148,63 @@ class UCIEngine(EngineWrapper):
             player_type = "computer" if title == "BOT" else "human"
             self.engine.configure({"UCI_Opponent": f"{title} {rating} {player_type} {name}"})
 
+    def report_game_result(self, game, board):
+        self.engine.protocol._position(board)
+
 
 class XBoardEngine(EngineWrapper):
     def __init__(self, commands, options, stderr):
+        self.go_commands = options.pop("go_commands", {}) or {}
         self.engine = chess.engine.SimpleEngine.popen_xboard(commands, stderr=stderr)
-
         egt_paths = options.pop("egtpath", {}) or {}
         features = self.engine.protocol.features
         egt_types_from_engine = features["egt"].split(",") if "egt" in features else []
         for egt_type in egt_types_from_engine:
             options[f"egtpath {egt_type}"] = egt_paths[egt_type]
         self.engine.configure(options)
-
         self.last_move_info = {}
-        self.time_control_sent = False
 
-    def set_time_control(self, game):
-        self.minutes = game.clock_initial // 1000 // 60
-        self.seconds = game.clock_initial // 1000 % 60
-        self.inc = game.clock_increment // 1000
+    def report_game_result(self, game, board):
+        # Send final moves, if any, to engine
+        self.engine.protocol._new(board, None, {})
 
-    def send_time(self):
-        self.engine.protocol.send_line(f"level 0 {self.minutes}:{self.seconds} {self.inc}")
-        self.time_control_sent = True
+        winner = game.state.get('winner')
+        termination = game.state.get('status')
 
-    def search_with_ponder(self, board, wtime, btime, winc, binc, ponder):
-        if not self.time_control_sent:
-            self.send_time()
+        if winner == 'white':
+            game_result = GameEnding.WHITE_WINS
+        elif winner == 'black':
+            game_result = GameEnding.BLACK_WINS
+        elif termination == Termination.DRAW:
+            game_result = GameEnding.DRAW
+        else:
+            game_result = GameEnding.INCOMPLETE
 
-        time_limit = chess.engine.Limit(white_clock=wtime / 1000,
-                                        black_clock=btime / 1000)
-        return self.search(board, time_limit, ponder)
+        if termination == Termination.MATE:
+            endgame_message = winner.title() + ' mates'
+        elif termination == Termination.TIMEOUT:
+            endgame_message = 'Time forfeiture'
+        elif termination == Termination.RESIGN:
+            resigner = 'black' if winner == 'white' else 'white'
+            endgame_message = resigner.title() + ' resigns'
+        elif termination == Termination.ABORT:
+            endgame_message = 'Game aborted'
+        elif termination == Termination.DRAW:
+            if board.is_fifty_moves():
+                endgame_message = '50-move rule'
+            elif board.is_repetition():
+                endgame_message = 'Threefold repetition'
+            else:
+                endgame_message = 'Draw by agreement'
+        elif termination:
+            endgame_message = termination
+        else:
+            endgame_message = ''
+
+        if endgame_message:
+            endgame_message = ' {' + endgame_message + '}'
+
+        self.engine.protocol.send_line('result ' + game_result + endgame_message)
 
     def stop(self):
         self.engine.protocol.send_line("?")
@@ -145,3 +217,8 @@ class XBoardEngine(EngineWrapper):
             self.engine.protocol.send_line(f"rating {game.me.rating} {game.opponent.rating}")
         if game.opponent.title == "BOT":
             self.engine.protocol.send_line("computer")
+
+
+def getHomemadeEngine(name):
+    import strategies
+    return eval(f"strategies.{name}")
