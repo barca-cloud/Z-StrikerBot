@@ -2,6 +2,9 @@
 import yaml
 import os
 import os.path
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 def load_config(config_file):
@@ -9,7 +12,7 @@ def load_config(config_file):
         try:
             CONFIG = yaml.safe_load(stream)
         except Exception as e:
-            print("There appears to be a syntax problem with your config.yml")
+            logger.error("There appears to be a syntax problem with your config.yml")
             raise e
 
         # [section, type, error message]
@@ -35,14 +38,14 @@ def load_config(config_file):
             raise Exception("Your config.yml has the default Lichess API token. This is probably wrong.")
 
         if not os.path.isdir(CONFIG["engine"]["dir"]):
-            raise Exception("Your engine directory `{}` is not a directory.")
+            raise Exception("Your engine directory `{}` is not a directory.".format(CONFIG["engine"]["dir"]))
 
         engine = os.path.join(CONFIG["engine"]["dir"], CONFIG["engine"]["name"])
 
-        if not os.path.isfile(engine):
+        if not os.path.isfile(engine) and CONFIG["engine"]["protocol"] != "homemade":
             raise Exception("The engine %s file does not exist." % engine)
 
-        if not os.access(engine, os.X_OK):
+        if not os.access(engine, os.X_OK) and CONFIG["engine"]["protocol"] != "homemade":
             raise Exception("The engine %s doesn't have execute (x) permission. Try: chmod +x %s" % (engine, engine))
 
     return CONFIG
